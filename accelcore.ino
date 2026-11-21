@@ -1,426 +1,350 @@
 /*
- * TableSlideAccel - measures one table slide rep per trigger, using an MMA7361 on an ESP32.
+ * AccelCore.h - rep counting and movement quality from one accelerometer axis.
  *
- * Board:    Tools > Board > esp32 > ESP32 Dev Module (ESP32-WROOM DevKit)
- * Output:   Serial Monitor at 115200 baud, and a web page (see Network below)
- * Sensor:   MMA7361 powered from VIN (5V); X -> D34, Y -> D35, Z -> D32; SL to the module's
- *           3V3 pin; GS to GND. Mount the module flat, with Y along the slide.
- *           All three are ADC1 pins, which keep working when Wi-Fi is on.
- * Button:   between D27 and GND, no resistor (uses the internal pull-up). Keep it off the sled.
+ * No Arduino dependency, so tests/test_accel_core.cpp can run it on a laptop.
  *
- * Network:  set your Wi-Fi in wifi_config.h. The address is printed on Serial at startup.
- *           Without Wi-Fi it creates an open network named "TableSlide": join it and open
- *           http://192.168.4.1. There is no login, so anyone on that network can start reps.
- *   GET  /            web page: start button, live status, results
- *   GET  /api/status  JSON status, session summary and recent reps
- *   POST /api/start   start (or restart) a rep, same as the button
- *   POST /api/reset   clear the session
+ * A rep is two strokes in opposite directions (out and back), with or without a pause
+ * between them. Direction comes from integrating acceleration into a velocity estimate,
+ * which is reset whenever the sled is at rest so errors cannot build up across a set.
+ * That estimate is only good enough for direction.
  *
- * Each trigger: keep the sled still while it calibrates (about 1 s). The onboard LED (GPIO2)
- * turns on when it is ready. Slide out and back, then stop. The rep is reported and the LED
- * turns off. Triggering again during an attempt restarts it.
+ * Distance is a separate estimate made after each movement ends. The sled is known to be
+ * stopped at both ends, so any velocity left over is drift and is removed before adding up the
+ * travel. It needs a stop after the rep, so reps that run together report no distance.
  *
- * Type in the Serial Monitor:
- *   s = same as a button press, e = print the session summary and reset it,
- *   r = raw data on/off, x/y/z = change the slide axis, ? = status
+ * Limit: very slow slides produce too little acceleration to separate from noise.
+ * The Config thresholds are starting values and need tuning on real data ("r" raw mode).
  */
+#pragma once
 
-// Arduino libraries for ESP32 boards
-#include <ESPmDNS.h>
-#include <WebServer.h>
-#include <WiFi.h>
+#include <math.h>
+#include <stdint.h>
 
+namespace accel {
 
-// Dependencies
-#include "accelcore_no_comments.h"
-#include "webUI.h"
-#include "wifi_config.h"
+static const float GRAVITY_MS2 = 9.81f;
+static const int MAX_MOVEMENT_SAMPLES = 2000;  // 20 s at 100 Hz. Longer reports no distance.
 
-static const uint8_t PIN_BUTTON = 27;
-static const uint8_t PIN_READY_LED = 2;  // Blue onboard LED on most ESP32 DevKits.
-static const uint8_t AXIS_PINS[] = {34, 35, 32};
-static const char AXIS_NAMES[] = {'x', 'y', 'z'};
+struct Config {
+  float filterAlpha = 0.3f;       // Low-pass strength. About 7 Hz at 100 Hz sampling.
+  float startG = 0.012f;          // Acceleration that counts as movement starting.
+  float stopG = 0.010f;           // Acceleration below this counts as quiet.
+  float directionMs = 0.02f;      // Velocity (m/s) needed to establish a direction.
+  float reversalFraction = 0.5f;  // Opposite velocity needed, as a fraction of the stroke's peak.
+  float restFraction = 0.3f;       // Velocity below this fraction of the peak can count as stopped.
+  float minPeakMs = 0.03f;        // Strokes below this velocity are bumps.
+  float leakTauS = 8.0f;          // Bleeds off velocity drift during long movements.
+  uint32_t quietMs = 300;         // Quiet and slow for this long = at rest.
+  uint32_t maxQuietMs = 700;      // Quiet this long = at rest, whatever the velocity estimate.
+  uint32_t minStrokeMs = 300;     // Shorter strokes are bumps.
+  uint32_t calibrateMs = 1000;    // Stillness needed at the start of a set.
+  float calibrateSpreadG = 0.04f;  // More variation than this means it was not still.
+};
 
-static const float V_PER_G = 0.8f;  // +/-1.5 g range. GS must be connected to GND.
-static const int ADC_SAMPLES = 16;
-static const uint32_t SAMPLE_PERIOD_MS = 10;
-static const uint32_t ATTEMPT_TIMEOUT_MS = 30000;  // Gives up if a rep never finishes.
-static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-static const int HISTORY_SIZE = 20;  // Reps kept for the web page.
+// Turns a noisy button reading into one event per press.
+class Debouncer {
+public:
+  // Pass whether the button reads as pressed. Returns true once per confirmed press.
+  bool update(bool pressed, uint32_t nowMs) {
+    if (pressed != lastReading_) {
+      lastReading_ = pressed;
+      changedMs_ = nowMs;
+    }
+    if (pressed != stable_ && nowMs - changedMs_ >= SETTLE_MS) {
+      stable_ = pressed;
+      return stable_;
+    }
+    return false;
+  }
 
-struct SessionStats {
+private:
+  static const uint32_t SETTLE_MS = 30;
+  bool stable_ = false;
+  bool lastReading_ = false;
+  uint32_t changedMs_ = 0;
+};
+
+enum Event : uint8_t { EVENT_NONE, EVENT_CALIBRATED, EVENT_CALIBRATION_RETRY, EVENT_REP };
+
+struct RepResult {
+  uint32_t number = 0;
+  float durationS = 0;
+  float peakG = 0;
+  float jerkRmsGS = 0;  // Lower is smoother. Only compare readings from the same setup.
+  float distanceCm = -1;  // Estimated total travel. Negative means unavailable.
+};
+
+struct SetSummary {
   uint32_t reps = 0;
-  float timeSum = 0;
-  float jerkSum = 0;
-  float distanceSum = 0;
-  uint32_t distanceCount = 0;
+  float durationS = 0;
+  float meanRepS = 0;
+  float repSpreadS = 0;  // Standard deviation of rep time: how even the pace was.
+  float meanJerkRmsGS = 0;
+  float meanDistanceCm = -1;  // Over reps that have a distance. Negative means none did.
 };
 
-struct HistoryEntry {
-  uint32_t number;
-  accel::RepResult rep;
+class Tracker {
+public:
+  explicit Tracker(const Config &config = Config()) : config_(config) {}
+
+  bool active() const { return mode_ != MODE_IDLE; }
+  bool calibrating() const { return mode_ == MODE_CALIBRATING; }
+  uint32_t reps() const { return reps_; }
+  const RepResult &lastResult() const { return result_; }
+
+  // The sled must be still. Calibration measures gravity on this axis, which is the tilt.
+  void startSet(uint32_t nowMs) {
+    mode_ = MODE_CALIBRATING;
+    reps_ = 0;
+    timeSum_ = timeSquaredSum_ = jerkSum_ = 0;
+    distanceSum_ = 0;
+    distanceCount_ = 0;
+    setStartMs_ = nowMs;
+    lastMs_ = nowMs;
+    beginCalibration(nowMs);
+  }
+
+  SetSummary endSet(uint32_t nowMs) {
+    SetSummary summary;
+    summary.reps = reps_;
+    summary.durationS = (nowMs - setStartMs_) / 1000.0f;
+    if (reps_ > 0) {
+      summary.meanRepS = timeSum_ / reps_;
+      const float variance = timeSquaredSum_ / reps_ - summary.meanRepS * summary.meanRepS;
+      summary.repSpreadS = variance > 0 ? sqrtf(variance) : 0.0f;
+      summary.meanJerkRmsGS = jerkSum_ / reps_;
+    }
+    if (distanceCount_ > 0) {
+      summary.meanDistanceCm = distanceSum_ / distanceCount_;
+    }
+    mode_ = MODE_IDLE;
+    return summary;
+  }
+
+  // Feed one reading of the slide axis, in g, at a steady rate.
+  Event update(float axisG, uint32_t nowMs) {
+    if (mode_ == MODE_IDLE) {
+      return EVENT_NONE;
+    }
+
+    const uint32_t elapsedMs = nowMs - lastMs_;
+    lastMs_ = nowMs;
+
+    if (mode_ == MODE_CALIBRATING) {
+      return updateCalibration(axisG, nowMs);
+    }
+
+    filtered_ += config_.filterAlpha * (axisG - filtered_);
+    const float a = filtered_ - baselineG_;
+
+    if (mode_ == MODE_REST) {
+      if (fabsf(a) <= config_.startG) {
+        baselineG_ += 0.01f * (filtered_ - baselineG_);  // Follows slow sensor drift.
+        return EVENT_NONE;
+      }
+      mode_ = MODE_MOVING;
+      velocity_ = 0;
+      direction_ = 0;
+      quietMs_ = 0;
+      strokePeak_ = 0;
+      motionStartMs_ = nowMs;
+      previousA_ = a;
+      rawVelocity_ = 0;
+      movementSamples_ = 0;
+      if (lastDirection_ == 0) {
+        clearRep();
+      }
+    }
+    return updateMoving(a, elapsedMs, nowMs);
+  }
+
+private:
+  enum Mode : uint8_t { MODE_IDLE, MODE_CALIBRATING, MODE_REST, MODE_MOVING };
+
+  void beginCalibration(uint32_t nowMs) {
+    calibrationStartMs_ = nowMs;
+    calibrationSum_ = 0;
+    calibrationCount_ = 0;
+    calibrationMin_ = 1e9f;
+    calibrationMax_ = -1e9f;
+  }
+
+  Event updateCalibration(float axisG, uint32_t nowMs) {
+    calibrationSum_ += axisG;
+    calibrationCount_++;
+    if (axisG < calibrationMin_) calibrationMin_ = axisG;
+    if (axisG > calibrationMax_) calibrationMax_ = axisG;
+
+    if (nowMs - calibrationStartMs_ < config_.calibrateMs) {
+      return EVENT_NONE;
+    }
+    if (calibrationMax_ - calibrationMin_ > config_.calibrateSpreadG) {
+      beginCalibration(nowMs);
+      return EVENT_CALIBRATION_RETRY;
+    }
+
+    baselineG_ = calibrationSum_ / calibrationCount_;
+    filtered_ = baselineG_;
+    lastDirection_ = 0;
+    clearRep();
+    mode_ = MODE_REST;
+    return EVENT_CALIBRATED;
+  }
+
+  void clearRep() {
+    repStartMs_ = 0;
+    repStarted_ = false;
+    repPeakG_ = 0;
+    jerkSquaredSum_ = 0;
+    jerkCount_ = 0;
+    repDistanceCm_ = 0;
+    repDistanceValid_ = true;
+  }
+
+  void recordMovementSample(float a, float dt) {
+    rawVelocity_ += a * GRAVITY_MS2 * dt;
+    if (movementSamples_ < MAX_MOVEMENT_SAMPLES) {
+      movementVelocity_[movementSamples_++] = rawVelocity_;
+    } else {
+      repDistanceValid_ = false;
+    }
+  }
+
+  // The sled is stopped at both ends of a movement, so velocity left at the end is drift.
+  void addMovementDistance(uint32_t nowMs) {
+    if (movementSamples_ < 2) {
+      return;
+    }
+    const float dt = (nowMs - motionStartMs_) / 1000.0f / (movementSamples_ - 1);
+    const float drift = movementVelocity_[movementSamples_ - 1];
+    float meters = 0;
+    for (int i = 0; i < movementSamples_; i++) {
+      meters += fabsf(movementVelocity_[i] - drift * i / (movementSamples_ - 1)) * dt;
+    }
+    repDistanceCm_ += meters * 100.0f;
+  }
+
+  Event updateMoving(float a, uint32_t elapsedMs, uint32_t nowMs) {
+    const float dt = elapsedMs / 1000.0f;
+    velocity_ += a * GRAVITY_MS2 * dt;
+    velocity_ -= velocity_ * dt / config_.leakTauS;
+    recordMovementSample(a, dt);
+
+    if (dt > 0) {
+      const float jerk = (a - previousA_) / dt;
+      jerkSquaredSum_ += jerk * jerk;
+      jerkCount_++;
+    }
+    previousA_ = a;
+    if (fabsf(a) > repPeakG_) {
+      repPeakG_ = fabsf(a);
+    }
+
+    const float speed = fabsf(velocity_);
+    Event event = EVENT_NONE;
+
+    if (direction_ == 0) {
+      if (speed > config_.directionMs) {
+        direction_ = velocity_ > 0 ? 1 : -1;
+        strokeStartMs_ = motionStartMs_;
+        strokePeak_ = speed;
+      }
+    } else if ((velocity_ > 0) == (direction_ > 0)) {
+      if (speed > strokePeak_) {
+        strokePeak_ = speed;
+      }
+    } else if (speed > config_.directionMs &&
+               speed > strokePeak_ * config_.reversalFraction) {
+      // Reversed without stopping.
+      const int8_t next = -direction_;
+      event = endStroke(nowMs, false);
+      direction_ = next;
+      strokeStartMs_ = nowMs;
+      strokePeak_ = speed;
+    }
+
+    quietMs_ = fabsf(a) < config_.stopG ? quietMs_ + elapsedMs : 0;
+    // Compared with the stroke's peak because the estimate ends a slide with some error left in
+    // it. A coasting sled keeps most of its peak, so it does not pass for stopped.
+    const float slowLimit = fmaxf(config_.directionMs, strokePeak_ * config_.restFraction);
+    const bool slow = speed < slowLimit;
+    if ((quietMs_ >= config_.quietMs && slow) || quietMs_ >= config_.maxQuietMs) {
+      addMovementDistance(nowMs);
+      const Event ended = endStroke(nowMs - quietMs_, true);
+      if (ended != EVENT_NONE) {
+        event = ended;
+      }
+      mode_ = MODE_REST;
+      velocity_ = 0;
+      direction_ = 0;
+    }
+    return event;
+  }
+
+  Event endStroke(uint32_t endMs, bool endedAtRest) {
+    const bool real = direction_ != 0 && endMs - strokeStartMs_ >= config_.minStrokeMs &&
+                      strokePeak_ >= config_.minPeakMs;
+    if (!real) {
+      return EVENT_NONE;
+    }
+
+    if (lastDirection_ == 0) {
+      lastDirection_ = direction_;
+      repStartMs_ = strokeStartMs_;
+      repStarted_ = true;
+      return EVENT_NONE;
+    }
+    if (direction_ == lastDirection_) {
+      return EVENT_NONE;  // A second push the same way: still the outward stroke.
+    }
+
+    reps_++;
+    result_.number = reps_;
+    result_.durationS = (endMs - repStartMs_) / 1000.0f;
+    result_.peakG = repPeakG_;
+    result_.jerkRmsGS = jerkCount_ ? sqrtf(jerkSquaredSum_ / jerkCount_) : 0.0f;
+    timeSum_ += result_.durationS;
+    timeSquaredSum_ += result_.durationS * result_.durationS;
+    jerkSum_ += result_.jerkRmsGS;
+    result_.distanceCm = endedAtRest && repDistanceValid_ ? repDistanceCm_ : -1.0f;
+    if (result_.distanceCm >= 0) {
+      distanceSum_ += result_.distanceCm;
+      distanceCount_++;
+    }
+    lastDirection_ = 0;
+    clearRep();
+    // This movement carries on into the next rep, so the next rep has no clean start either.
+    repDistanceValid_ = endedAtRest;
+    return EVENT_REP;
+  }
+
+  Config config_;
+  Mode mode_ = MODE_IDLE;
+  uint32_t lastMs_ = 0;
+  uint32_t setStartMs_ = 0;
+  uint32_t reps_ = 0;
+  float timeSum_ = 0, timeSquaredSum_ = 0, jerkSum_ = 0, distanceSum_ = 0;
+  uint32_t distanceCount_ = 0;
+
+  uint32_t calibrationStartMs_ = 0;
+  float calibrationSum_ = 0, calibrationMin_ = 0, calibrationMax_ = 0;
+  uint32_t calibrationCount_ = 0;
+
+  float baselineG_ = 0, filtered_ = 0, velocity_ = 0, previousA_ = 0;
+  int8_t direction_ = 0, lastDirection_ = 0;
+  uint32_t quietMs_ = 0, motionStartMs_ = 0, strokeStartMs_ = 0;
+  float strokePeak_ = 0;
+
+  uint32_t repStartMs_ = 0;
+  bool repStarted_ = false;
+  float repPeakG_ = 0, jerkSquaredSum_ = 0;
+  uint32_t jerkCount_ = 0;
+  RepResult result_;
+
+  float rawVelocity_ = 0, repDistanceCm_ = 0;
+  bool repDistanceValid_ = true;
+  int movementSamples_ = 0;
+  float movementVelocity_[MAX_MOVEMENT_SAMPLES];
 };
 
-static accel::Tracker tracker;
-static accel::Debouncer button;
-static SessionStats session;
-static HistoryEntry history[HISTORY_SIZE];
-static int historyCount = 0;  // Newest entry is at (historyNext - 1).
-static int historyNext = 0;
-static uint8_t axis = 1;  // Y: real recordings showed the slide on this axis, with X only tilting.
-static bool rawMode = false;
-static bool waitingForRep = false;
-static uint32_t readySinceMs = 0;
-static String statusMessage = "Press Start or the button to begin a rep.";
-static WebServer server(80);
-static String networkAddress = "not connected";
-
-// Volts-based g with no zero offset: the tracker calibrates that out for each attempt.
-// analogReadMilliVolts applies the ESP32's factory ADC calibration.
-static float readAxisG(uint8_t which) {
-  uint32_t totalMv = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-    totalMv += analogReadMilliVolts(AXIS_PINS[which]);
-  }
-  return (totalMv / (float)ADC_SAMPLES) / 1000.0f / V_PER_G;
-}
-
-static void setReadyLight(bool on) {
-  digitalWrite(PIN_READY_LED, on ? HIGH : LOW);
-}
-
-static const char *stateName() {
-  if (!tracker.active()) {
-    return "idle";
-  }
-  return waitingForRep ? "ready" : "calibrating";
-}
-
-static void setMessage(const String &message) {
-  statusMessage = message;
-  Serial.print(F("# "));
-  Serial.println(message);
-}
-
-static void printDistance(float distanceCm) {
-  if (distanceCm >= 0) {
-    Serial.println(distanceCm, 0);
-  } else {
-    Serial.println(F("na"));
-  }
-}
-
-static void printStatus() {
-  Serial.print(F("# status axis="));
-  Serial.print(AXIS_NAMES[axis]);
-  Serial.print(F(" attempt="));
-  Serial.print(stateName());
-  Serial.print(F(" reps="));
-  Serial.print(session.reps);
-  Serial.print(F(" web="));
-  Serial.println(networkAddress);
-}
-
-static void printSessionSummary() {
-  Serial.print(F("SESSION reps="));
-  Serial.print(session.reps);
-  Serial.print(F(" mean_rep_s="));
-  Serial.print(session.reps ? session.timeSum / session.reps : 0.0f, 2);
-  Serial.print(F(" mean_jerk="));
-  Serial.print(session.reps ? session.jerkSum / session.reps : 0.0f, 3);
-  Serial.print(F(" mean_est_dist_cm="));
-  printDistance(session.distanceCount ? session.distanceSum / session.distanceCount : -1.0f);
-}
-
-static void resetSession() {
-  session = SessionStats();
-  historyCount = 0;
-  historyNext = 0;
-}
-
-static void endAttempt(uint32_t now) {
-  tracker.endSet(now);
-  waitingForRep = false;
-  setReadyLight(false);
-}
-
-static void startAttempt(uint32_t now, const char *source) {
-  waitingForRep = false;
-  setReadyLight(false);
-  tracker.startSet(now);
-  setMessage(String("Started from ") + source + ". Keep the sled still...");
-}
-
-static void recordRep(const accel::RepResult &rep) {
-  session.reps++;
-  session.timeSum += rep.durationS;
-  session.jerkSum += rep.jerkRmsGS;
-  if (rep.distanceCm >= 0) {
-    session.distanceSum += rep.distanceCm;
-    session.distanceCount++;
-  }
-
-  history[historyNext] = {session.reps, rep};
-  historyNext = (historyNext + 1) % HISTORY_SIZE;
-  if (historyCount < HISTORY_SIZE) {
-    historyCount++;
-  }
-
-  Serial.print(F("REP "));
-  Serial.print(session.reps);
-  Serial.print(F(" time_s="));
-  Serial.print(rep.durationS, 2);
-  Serial.print(F(" peak_g="));
-  Serial.print(rep.peakG, 3);
-  Serial.print(F(" jerk="));
-  Serial.print(rep.jerkRmsGS, 3);
-  Serial.print(F(" est_dist_cm="));
-  printDistance(rep.distanceCm);
-}
-
-static void setAxis(uint8_t newAxis) {
-  if (tracker.active()) {
-    endAttempt(millis());
-  }
-  axis = newAxis;
-  printStatus();
-}
-
-// ---- Web server ----
-
-static String jsonNumber(float value, int decimals) {
-  return String(value, decimals);
-}
-
-static String jsonOptional(float value, int decimals, bool present) {
-  return present ? String(value, decimals) : String("null");
-}
-
-static String jsonEscape(const String &text) {
-  String out;
-  for (size_t i = 0; i < text.length(); i++) {
-    const char c = text[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-    }
-    if ((uint8_t)c >= 0x20) {
-      out += c;
-    }
-  }
-  return out;
-}
-
-static String statusJson() {
-  String json;
-  json.reserve(256 + historyCount * 110);
-  json += "{\"state\":\"";
-  json += stateName();
-  json += "\",\"message\":\"";
-  json += jsonEscape(statusMessage);
-  json += "\",\"axis\":\"";
-  json += AXIS_NAMES[axis];
-  json += "\",\"session\":{\"reps\":";
-  json += session.reps;
-  json += ",\"meanTime\":";
-  json += jsonOptional(session.reps ? session.timeSum / session.reps : 0, 2, session.reps > 0);
-  json += ",\"meanJerk\":";
-  json += jsonOptional(session.reps ? session.jerkSum / session.reps : 0, 3, session.reps > 0);
-  json += ",\"meanDist\":";
-  json += jsonOptional(session.distanceCount ? session.distanceSum / session.distanceCount : 0, 1,
-                       session.distanceCount > 0);
-  json += "},\"history\":[";
-  for (int i = 0; i < historyCount; i++) {
-    const HistoryEntry &h = history[(historyNext - 1 - i + HISTORY_SIZE) % HISTORY_SIZE];
-    if (i > 0) {
-      json += ',';
-    }
-    json += "{\"n\":";
-    json += h.number;
-    json += ",\"time\":";
-    json += jsonNumber(h.rep.durationS, 2);
-    json += ",\"peak\":";
-    json += jsonNumber(h.rep.peakG, 3);
-    json += ",\"jerk\":";
-    json += jsonNumber(h.rep.jerkRmsGS, 3);
-    json += ",\"dist\":";
-    json += jsonOptional(h.rep.distanceCm, 1, h.rep.distanceCm >= 0);
-    json += '}';
-  }
-  json += "]}";
-  return json;
-}
-
-static void sendJson(int code, const String &body) {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(code, "application/json", body);
-}
-
-static void setupWebServer() {
-  server.on("/", HTTP_GET, [] { server.send(200, "text/html", WEB_UI); });
-  server.on("/api/status", HTTP_GET, [] { sendJson(200, statusJson()); });
-  server.on("/api/start", HTTP_POST, [] {
-    startAttempt(millis(), "web");
-    sendJson(200, statusJson());
-  });
-  server.on("/api/reset", HTTP_POST, [] {
-    if (tracker.active()) {
-      endAttempt(millis());
-    }
-    resetSession();
-    setMessage("Session cleared.");
-    sendJson(200, statusJson());
-  });
-  server.onNotFound([] { sendJson(404, "{\"error\":\"not found\"}"); });
-  server.begin();
-}
-
-static void startOwnNetwork() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_NAME);  // Open network: no password, as requested.
-  networkAddress = String("http://") + WiFi.softAPIP().toString() + " on Wi-Fi \"" + AP_NAME + "\"";
-}
-
-static void setupNetwork() {
-  if (strlen(WIFI_SSID) > 0) {
-    Serial.print(F("# joining Wi-Fi \""));
-    Serial.print(WIFI_SSID);
-    Serial.println(F("\"..."));
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    const uint32_t started = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(250);
-    }
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    networkAddress = String("http://") + WiFi.localIP().toString();
-  } else {
-    if (strlen(WIFI_SSID) > 0) {
-      Serial.println(F("# could not join Wi-Fi, starting own network instead"));
-    }
-    startOwnNetwork();
-  }
-
-  if (MDNS.begin(MDNS_NAME)) {
-    MDNS.addService("http", "tcp", 80);
-  }
-  setupWebServer();
-  Serial.print(F("# web page: "));
-  Serial.print(networkAddress);
-  Serial.print(F("  (or http://"));
-  Serial.print(MDNS_NAME);
-  Serial.println(F(".local)"));
-}
-
-// ---- Serial ----
-
-static void handleCommand(char command) {
-  switch (command) {
-    case 's':
-      startAttempt(millis(), "serial");
-      break;
-    case 'e':
-      printSessionSummary();
-      resetSession();
-      break;
-    case 'r':
-      rawMode = !rawMode;
-      Serial.println(rawMode ? F("# raw on: t_ms,slide_axis_g,x_g,y_g,z_g") : F("# raw off"));
-      break;
-    case 'x':
-      setAxis(0);
-      break;
-    case 'y':
-      setAxis(1);
-      break;
-    case 'z':
-      setAxis(2);
-      break;
-    case '?':
-      printStatus();
-      break;
-    case '\r':
-    case '\n':
-    case ' ':
-      break;
-    default:
-      Serial.println(F("# commands: s e r x y z ?"));
-      break;
-  }
-}
-
-static void printRawLine(uint32_t now, float g) {
-  Serial.print(now);
-  Serial.print(',');
-  Serial.print(g, 4);
-  for (uint8_t i = 0; i < 3; i++) {
-    Serial.print(',');
-    Serial.print(i == axis ? g : readAxisG(i), 4);
-  }
-  Serial.println();
-}
-
-void setup() {
-  Serial.begin(115200);
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);  // About 0 to 3.1 V, covering the sensor's 0.45 to 2.85 V.
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
-  pinMode(PIN_READY_LED, OUTPUT);
-  setReadyLight(false);
-  delay(500);
-  Serial.println(F("# TableSlideAccel. Press the button, or Start on the web page."));
-  setupNetwork();
-  printStatus();
-}
-
-void loop() {
-  server.handleClient();
-
-  while (Serial.available() > 0) {
-    handleCommand((char)Serial.read());
-  }
-
-  // Checked on every pass, so a press is not missed between sensor readings.
-  if (button.update(digitalRead(PIN_BUTTON) == LOW, millis())) {
-    startAttempt(millis(), "button");
-  }
-
-  static uint32_t lastSample = 0;
-  const uint32_t now = millis();
-  if (now - lastSample < SAMPLE_PERIOD_MS) {
-    return;
-  }
-  lastSample = now;
-
-  const float g = readAxisG(axis);
-  if (rawMode) {
-    printRawLine(now, g);
-  }
-
-  switch (tracker.update(g, now)) {
-    case accel::EVENT_NONE:
-      break;
-    case accel::EVENT_CALIBRATED:
-      waitingForRep = true;
-      readySinceMs = now;
-      setReadyLight(true);
-      setMessage("Ready, start sliding.");
-      break;
-    case accel::EVENT_CALIBRATION_RETRY:
-      setMessage("Moved during calibration, keep the sled still...");
-      break;
-    case accel::EVENT_REP:
-      recordRep(tracker.lastResult());
-      endAttempt(now);
-      setMessage("Rep recorded. Start the next one when ready.");
-      break;
-  }
-
-  if (waitingForRep && now - readySinceMs >= ATTEMPT_TIMEOUT_MS) {
-    endAttempt(now);
-    setMessage("Timed out with no complete rep. Start again to retry.");
-  }
-}
+}  // namespace accel
